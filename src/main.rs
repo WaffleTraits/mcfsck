@@ -5,6 +5,7 @@ mod codec;
 mod fix;
 mod nbt;
 mod progress;
+mod repair;
 mod report;
 mod scan;
 #[cfg(test)]
@@ -33,6 +34,8 @@ Examples:
   mcfsck scan world -o report.jsonl           also save a machine-readable report
   mcfsck fix  world                           dry run: show what would be removed
   mcfsck fix  world --apply                   remove unloadable chunks (asks first)
+  mcfsck fix  world --repair                  dry run: show what can be repaired without loss
+  mcfsck fix  world --repair --apply          repair that; nothing is removed
 
 WORLD can be a world folder, a dimension folder, a region folder or a single
 r.X.Z.mca file. Scanning never writes. Stop the server before `fix --apply`;
@@ -49,7 +52,8 @@ struct Cli {
 enum Cmd {
     /// Check every chunk and list the problems (read-only)
     Scan(ScanArgs),
-    /// Remove chunks the game cannot load, so that it generates them anew (dry run unless --apply)
+    /// Remove chunks the game cannot load so that it generates them anew, or with --repair
+    /// repair those that can be repaired without loss (dry run unless --apply)
     Fix(FixArgs),
     /// Full-screen interface: scan, browse, preview and fix
     Tui(TuiArgs),
@@ -111,6 +115,11 @@ struct FixArgs {
     /// Show what would be done and write nothing (the default)
     #[arg(long, conflicts_with = "apply")]
     dry_run: bool,
+    /// Repair instead of remove: put right what can be put right without losing anything (bad
+    /// length fields, compression markers and sector counts, lost header entries, misfiled
+    /// chunks). Removes nothing; what cannot be repaired is listed and left as it is
+    #[arg(long, conflicts_with = "warnings")]
+    repair: bool,
     /// Also fix warnings: unused .mcc files, and chunks that are odd but still load
     #[arg(long)]
     warnings: bool,
@@ -231,7 +240,9 @@ fn cmd_scan(args: &ScanArgs) -> Result<ExitCode> {
             writeln!(stdout, "Report saved to {}", path.display())?;
         }
         if out.count(Severity::Error) > 0 {
-            writeln!(stdout, "`mcfsck fix {}` shows what removing the unloadable chunks would do.", args.common.world.display())?;
+            let world = args.common.world.display();
+            writeln!(stdout, "`mcfsck fix {world} --repair` shows what can be repaired without losing anything.")?;
+            writeln!(stdout, "`mcfsck fix {world}` shows what removing the unloadable chunks would do.")?;
         }
     }
     Ok(if out.findings.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
@@ -248,11 +259,87 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+/// `fix --repair`: repair what can be repaired without loss; remove nothing.
+fn cmd_repair(args: &FixArgs, out: &ScanOutput) -> Result<ExitCode> {
+    let picked: Vec<&Finding> = out
+        .findings
+        .iter()
+        .filter(|f| if args.kind.is_empty() { f.severity() == Severity::Error } else { args.kind.contains(&f.kind) })
+        .collect();
+    if picked.is_empty() {
+        println!("Nothing to repair{}.", if out.findings.is_empty() { "" } else { ": there are no errors of that kind" });
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut opts = FixOptions { dry_run: true, backup: !args.safety.no_backup, force: args.safety.force, linked: false };
+    let progress = fix::Progress::default();
+    let preview = repair::execute(&out.root, &picked, &opts, &progress)?;
+    println!();
+    for (o, f) in preview.outcomes.iter().zip(&picked) {
+        println!("{}", o.line(f, true));
+    }
+    for w in &preview.warnings {
+        println!("warning: {w}");
+    }
+    println!();
+    println!("{}", preview.summary());
+    let (repairable, hopeless, _) = preview.repair_counts();
+    let rest = |n: u64| {
+        if n > 0 {
+            println!(
+                "What cannot be repaired can only be removed, so that the game generates it anew: `mcfsck fix {}` shows that.",
+                args.common.world.display()
+            );
+        }
+    };
+    if repairable == 0 || !args.apply {
+        if repairable > 0 {
+            println!("Run again with --apply to make these repairs.");
+        }
+        rest(hopeless);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !opts.force && world::in_use(&out.root) {
+        bail!("this world is open in a running game or server. Stop it first; nothing was written.");
+    }
+    let question = format!(
+        "Repair {} chunk{} in {}{}?",
+        human_count(repairable),
+        s(repairable),
+        out.root.display(),
+        if opts.backup { "" } else { " WITHOUT a backup" }
+    );
+    if !args.yes && !confirm(&question)? {
+        println!("Nothing was written.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    opts.dry_run = false;
+    let done = repair::execute(&out.root, &picked, &opts, &progress)?;
+    println!();
+    for (o, f) in done.outcomes.iter().zip(&picked) {
+        if matches!(o.status, Status::Skipped(_)) {
+            println!("{}", o.line(f, false));
+        }
+    }
+    for w in &done.warnings {
+        println!("warning: {w}");
+    }
+    println!("{}", done.summary());
+    if let Some(dir) = &done.backup_dir {
+        println!("The original of every changed file is in {}", dir.display());
+        println!("To undo, copy those files back over the world's (with the server stopped).");
+    }
+    rest(done.repair_counts().1);
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_fix(args: &FixArgs) -> Result<ExitCode> {
     let out = scan_with_progress(&args.common)?;
     note_if_in_use(&out);
     println!("{}", out.speed_line());
     println!("{}", out.verdict());
+    if args.repair {
+        return cmd_repair(args, &out);
+    }
     let picked: Vec<&Finding> = out
         .findings
         .iter()
@@ -390,6 +477,9 @@ mod tests {
         assert_eq!(args.common.threads, Some(4));
         assert!(args.apply && args.yes && !args.safety.no_backup);
         assert!(Cli::try_parse_from(["mcfsck", "fix", "w", "--apply", "--dry-run"]).is_err());
+        let cli = Cli::try_parse_from(["mcfsck", "fix", "w", "--repair", "--apply"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Fix(args) if args.repair && args.apply));
+        assert!(Cli::try_parse_from(["mcfsck", "fix", "w", "--repair", "--warnings"]).is_err());
         assert!(Cli::try_parse_from(["mcfsck", "fix", "w", "--kind", "nonsense"]).is_err());
         assert!(Cli::try_parse_from(["mcfsck", "scan", "w", "-j", "0"]).is_err());
         assert!(Cli::try_parse_from(["mcfsck", "tui", "w", "--theme", "mc", "--no-mouse"]).is_ok());

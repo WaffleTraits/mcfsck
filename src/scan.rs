@@ -427,7 +427,7 @@ struct Cand {
     slot: Slot,
 }
 
-type Problem = (Kind, String);
+pub type Problem = (Kind, String);
 
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
@@ -571,6 +571,51 @@ fn examine(
             }
             content_problem(f.store, pos, &info)
         }
+    }
+}
+
+/// The scan's checks for single chunk records, for [`crate::repair`].
+#[derive(Default)]
+pub struct Checker {
+    ext: Vec<u8>,
+    out: Vec<u8>,
+    codec: Codec,
+}
+
+impl Checker {
+    /// The full check of the chunk record `data`, as if it were stored for
+    /// chunk `pos` in exactly these bytes.
+    pub fn check(&mut self, f: &FileRef, pos: (i32, i32), data: &[u8]) -> Option<Problem> {
+        let (mut externals, mut containers) = (Vec::new(), 0);
+        examine(f, pos, data, data.len(), false, &mut self.ext, &mut self.out, &mut self.codec, &mut externals, &mut containers)
+    }
+
+    /// Which chunk the record `data` is, if it is a complete chunk of this
+    /// file's store with nothing wrong with it, and the game tick it says it
+    /// was saved at.
+    pub fn identify(&mut self, f: &FileRef, data: &[u8]) -> Option<((i32, i32), Option<i64>)> {
+        if data.len() < 5 {
+            return None;
+        }
+        let length = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let scheme = data[4];
+        if length < 1 || !codec::known_scheme(scheme) || (length - 1) as usize > data.len() - 5 {
+            return None;
+        }
+        self.codec.decompress(scheme, &data[5..4 + length as usize], &mut self.out).ok()?;
+        let info = nbt::inspect(&self.out, matches!(f.store, Store::Region | Store::Other)).ok()?;
+        let pos = match f.store {
+            Store::Region => info.terrain_pos(),
+            Store::Entities => info.entity_pos,
+            Store::Poi => None,
+            Store::Other => info.terrain_pos().or(info.entity_pos),
+        }?;
+        content_problem(f.store, pos, &info).is_none().then_some((pos, info.last_update))
+    }
+
+    /// See [`Codec::stream_len`].
+    pub fn stream_len(&mut self, scheme: u8, data: &[u8]) -> Option<usize> {
+        self.codec.stream_len(scheme, data, &mut self.out)
     }
 }
 

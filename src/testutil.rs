@@ -32,6 +32,10 @@ impl Nbt {
         self.head(3, name).raw(&v.to_be_bytes())
     }
 
+    pub fn long(&mut self, name: &str, v: i64) -> &mut Self {
+        self.head(4, name).raw(&v.to_be_bytes())
+    }
+
     pub fn string(&mut self, name: &str, v: &str) -> &mut Self {
         self.head(8, name).raw(&(v.len() as u16).to_be_bytes()).raw(v.as_bytes())
     }

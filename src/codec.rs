@@ -63,6 +63,24 @@ impl Codec {
         }
     }
 
+    /// The length of the complete zlib or gzip stream that `data` starts
+    /// with, whatever follows it. `out` receives the decompressed data.
+    pub fn stream_len(&mut self, scheme: u8, data: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+        match scheme {
+            1 => {
+                out.clear();
+                let mut gz = flate2::bufread::GzDecoder::new(data);
+                let n = (&mut gz).take(MAX_OUT as u64 + 1).read_to_end(out).ok()?;
+                (n <= MAX_OUT).then(|| data.len() - gz.into_inner().len())
+            }
+            2 => {
+                self.zlib(data, out).ok()?;
+                Some(self.z.total_in() as usize)
+            }
+            _ => None,
+        }
+    }
+
     fn zlib(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), DecodeError> {
         const STEP: usize = 1 << 17;
         self.z.reset(true);
@@ -223,6 +241,28 @@ mod tests {
 
     fn sample(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 7 + i / 300) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn stream_lengths() {
+        let mut codec = Codec::default();
+        let mut out = Vec::new();
+        let data = sample(50_000);
+        for (scheme, packed) in [(1u8, gzip(&data)), (2, zlib(&data))] {
+            let mut padded = packed.clone();
+            padded.extend_from_slice(&[0; 3000]);
+            padded.extend_from_slice(b"garbage");
+            assert_eq!(codec.stream_len(scheme, &padded, &mut out), Some(packed.len()), "scheme {scheme}");
+            assert_eq!(out, data);
+            assert_eq!(codec.stream_len(scheme, &packed, &mut out), Some(packed.len()));
+            assert_eq!(codec.stream_len(scheme, &packed[..packed.len() - 1], &mut out), None);
+            let mut bad = padded.clone();
+            bad[packed.len() / 2] ^= 0x10;
+            assert_eq!(codec.stream_len(scheme, &bad, &mut out), None);
+            assert_eq!(codec.stream_len(scheme, &[], &mut out), None);
+        }
+        assert_eq!(codec.stream_len(3, &data, &mut out), None);
+        assert_eq!(codec.stream_len(4, &lz4(&data, 4096), &mut out), None);
     }
 
     #[test]

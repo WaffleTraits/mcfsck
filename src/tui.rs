@@ -8,6 +8,7 @@
 
 use crate::fix::{self, FixOptions, Status};
 use crate::progress::{human_duration, Eta};
+use crate::repair;
 use crate::report;
 use crate::scan::{self, Finding, Fix, ScanOutput, Severity};
 use crate::util::{human_bytes, human_count, s};
@@ -58,7 +59,7 @@ enum SortKey {
 
 enum RowState {
     Fresh,
-    /// Removed in this session.
+    /// Removed or repaired in this session.
     Done(String),
     Skipped(String),
 }
@@ -75,12 +76,14 @@ struct FixJob {
     rx: Receiver<Result<fix::Report>>,
     targets: Vec<usize>,
     dry: bool,
+    /// Repair instead of remove.
+    repair: bool,
 }
 
 enum PagerKind {
     Info,
     /// A dry run; Enter applies it for real if it would do anything.
-    DryRun { targets: Vec<usize>, actionable: bool },
+    DryRun { targets: Vec<usize>, actionable: bool, repair: bool },
     /// The world was modified.
     Done,
 }
@@ -541,8 +544,8 @@ impl App {
         }
     }
 
-    /// Fix `targets` in the background, as a dry run or for real.
-    fn start_fix(&mut self, targets: Vec<usize>, dry: bool) {
+    /// Remove or repair `targets` in the background, as a dry run or for real.
+    fn start_fix(&mut self, targets: Vec<usize>, dry: bool, repair: bool) {
         let Some(out) = self.out.clone() else { return };
         let progress = Arc::new(fix::Progress::default());
         let (tx, rx) = mpsc::channel();
@@ -550,9 +553,13 @@ impl App {
         let (shared, picked) = (progress.clone(), targets.clone());
         std::thread::spawn(move || {
             let selected: Vec<&Finding> = picked.iter().map(|&i| &out.findings[i]).collect();
-            let _ = tx.send(fix::execute(&out.root, &selected, &opts, &shared));
+            let _ = tx.send(if repair {
+                repair::execute(&out.root, &selected, &opts, &shared)
+            } else {
+                fix::execute(&out.root, &selected, &opts, &shared)
+            });
         });
-        self.mode = Mode::Working(FixJob { progress, eta: Eta::new(), rx, targets, dry });
+        self.mode = Mode::Working(FixJob { progress, eta: Eta::new(), rx, targets, dry, repair });
     }
 
     fn finish_fix(&mut self, job: FixJob, result: Result<fix::Report>) {
@@ -564,6 +571,8 @@ impl App {
             }
         };
         let (chunks, files, _, _) = report.counts();
+        let (repaired, hopeless, _) = report.repair_counts();
+        let changes = chunks + files + repaired;
         let mut lines = vec![report.summary()];
         if let Some(dir) = &report.backup_dir {
             lines.push(format!("The original of every changed file is in {}", dir.display()));
@@ -572,6 +581,9 @@ impl App {
         }
         for w in &report.warnings {
             lines.push(format!("warning: {w}"));
+        }
+        if hopeless > 0 {
+            lines.push("What cannot be repaired can only be removed (d), so that the game generates it anew.".to_string());
         }
         lines.push(String::new());
         let findings = self.findings();
@@ -584,7 +596,7 @@ impl App {
                 title: "Preview (dry run) - nothing has been written yet".to_string(),
                 lines,
                 scroll: 0,
-                kind: PagerKind::DryRun { targets: job.targets, actionable: chunks + files > 0 },
+                kind: PagerKind::DryRun { targets: job.targets, actionable: changes > 0, repair: job.repair },
             };
             return;
         }
@@ -592,11 +604,12 @@ impl App {
             self.selected[i] = false;
             match &o.status {
                 Status::Removed => self.state[i] = RowState::Done("removed".to_string()),
+                Status::Repaired(_) => self.state[i] = RowState::Done("repaired".to_string()),
                 Status::Skipped(why) => self.state[i] = RowState::Skipped(why.clone()),
-                Status::NoFix => {}
+                Status::NoFix | Status::NotRepairable(_) => {}
             }
         }
-        if chunks + files > 0 {
+        if changes > 0 {
             self.stale = true;
         }
         self.status = report.summary();
@@ -664,7 +677,12 @@ Fixing  (the selection, or the current finding if nothing is selected)
                       file so the game generates them anew; unused files are
                       deleted. A terrain chunk takes its entity and
                       point-of-interest data with it.
-  This first runs as a dry run and shows exactly what it would do; nothing
+  p                   repair: put right what can be put right without losing
+                      anything - bad length fields, compression markers and
+                      sector counts, header entries that lost their data,
+                      chunks filed under the wrong position. Removes nothing;
+                      what cannot be repaired is listed and left as it is.
+  Both first run as a dry run and show exactly what they would do; nothing
   is written until you confirm that preview.
 
 Other
@@ -718,10 +736,12 @@ to <world>/mcfsck-backups/ before it is changed.";
     // -- actions ------------------------------------------------------------
 
     /// Start the dry run of the fix.
-    fn begin_fix(&mut self) {
+    fn begin_fix(&mut self, repair: bool) {
         let targets = self.targets();
         if targets.is_empty() {
             self.status = "Nothing to act on.".to_string();
+        } else if repair {
+            self.start_fix(targets, true, true);
         } else if targets.iter().all(|&i| self.findings()[i].fix() == Fix::None) {
             self.message(
                 "Nothing to remove",
@@ -731,7 +751,7 @@ to <world>/mcfsck-backups/ before it is changed.";
                 ],
             );
         } else {
-            self.start_fix(targets, true);
+            self.start_fix(targets, true, false);
         }
     }
 
@@ -796,8 +816,8 @@ to <world>/mcfsck-backups/ before it is changed.";
                 }
                 match (k.code, kind) {
                     (KeyCode::Esc | KeyCode::Char('q'), _) => {}
-                    (KeyCode::Enter | KeyCode::Char('y'), PagerKind::DryRun { targets, actionable: true }) => {
-                        self.start_fix(targets, false)
+                    (KeyCode::Enter | KeyCode::Char('y'), PagerKind::DryRun { targets, actionable: true, repair }) => {
+                        self.start_fix(targets, false, repair)
                     }
                     (KeyCode::Enter, PagerKind::Info | PagerKind::Done) => {}
                     (KeyCode::Char('r'), PagerKind::Done) => self.start_scan(),
@@ -846,7 +866,8 @@ to <world>/mcfsck-backups/ before it is changed.";
                 }
                 self.status = format!("Selected the {} error{} shown.", human_count(errors.len() as u64), s(errors.len() as u64));
             }
-            KeyCode::Char('d') | KeyCode::Char('f') | KeyCode::Delete => self.begin_fix(),
+            KeyCode::Char('d') | KeyCode::Char('f') | KeyCode::Delete => self.begin_fix(false),
+            KeyCode::Char('p') => self.begin_fix(true),
             KeyCode::Enter => self.details(),
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('s') => {
@@ -988,7 +1009,8 @@ to <world>/mcfsck-backups/ before it is changed.";
             Button::new("e", "Errors", c('e')),
             Button::new("n", "None", c('n')),
             Button::new("i", "Invert", c('i')),
-            Button::new("d", "Remove (preview first)", c('d')),
+            Button::new("p", "Repair", c('p')),
+            Button::new("d", "Remove (both preview first)", c('d')),
             Button::new("Enter", "Details", KeyCode::Enter),
             Button::new("/", "Filter", c('/')),
             Button::new("s", "Sort", c('s')),
@@ -1255,7 +1277,12 @@ to <world>/mcfsck-backups/ before it is changed.";
         let total = job.progress.total.load(Ordering::Relaxed);
         let done = job.progress.done.load(Ordering::Relaxed).min(total);
         let ratio = if total == 0 { 0.0 } else { done as f64 / total as f64 };
-        let title = if job.dry { "Working out what would change (dry run)" } else { "Applying changes to the world" };
+        let title = match (job.dry, job.repair) {
+            (true, false) => "Working out what would change (dry run)",
+            (true, true) => "Working out what can be repaired (dry run)",
+            (false, false) => "Applying changes to the world",
+            (false, true) => "Repairing chunks",
+        };
         let inner = self.popup(f, centered(area, 70, 8), title);
         let [what, _, gauge, _, line] = Layout::vertical([
             Constraint::Length(1),
@@ -1319,8 +1346,8 @@ to <world>/mcfsck-backups/ before it is changed.";
 
         let mut buttons = match kind {
             PagerKind::Info => vec![Button::new("Esc", "Close", KeyCode::Esc)],
-            PagerKind::DryRun { actionable: true, .. } => vec![
-                Button::new("Enter", "Apply this to the world", KeyCode::Enter),
+            PagerKind::DryRun { actionable: true, repair, .. } => vec![
+                Button::new("Enter", if *repair { "Make these repairs" } else { "Apply this to the world" }, KeyCode::Enter),
                 Button::new("Esc", "Cancel", KeyCode::Esc),
             ],
             PagerKind::DryRun { .. } => vec![Button::new("Esc", "Close - nothing to apply", KeyCode::Esc)],
@@ -1505,7 +1532,7 @@ mod tests {
         assert!(all.contains("overworld region") && all.contains("overworld entities"));
         assert!(all.contains("wrong chunk position"));
         assert!(all.contains("Details") && all.contains("what  ") && all.contains("fix   "));
-        assert!(all.contains(" d  Remove (preview first)") && all.contains(" q  Quit"));
+        assert!(all.contains(" p  Repair") && all.contains(" d  Remove (both preview first)") && all.contains(" q  Quit"));
         // The same in the other theme.
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(app.theme, ThemeName::Mc);
@@ -1650,7 +1677,7 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(!app.quit);
         wait(&mut app);
-        let Mode::Pager { title, lines, kind: PagerKind::DryRun { actionable: true, targets }, .. } = &app.mode else {
+        let Mode::Pager { title, lines, kind: PagerKind::DryRun { actionable: true, repair: false, targets }, .. } = &app.mode else {
             panic!("no preview")
         };
         assert!(title.contains("dry run"));
@@ -1698,6 +1725,49 @@ mod tests {
         assert_eq!(app.findings().len(), 3);
         assert!(!app.stale);
         assert!(screen(&mut app, 140, 40)[0].contains("0 errors, 3 warnings"));
+    }
+
+    #[test]
+    fn repair_previews_then_repairs() {
+        let tmp = TempDir::new("tui-repair");
+        let mut app = app(&tmp);
+        let region = tmp.path().join("region/r.0.0.mca");
+        let before = std::fs::read(&region).unwrap();
+        let errors = app.findings().iter().filter(|f| f.severity() == Severity::Error).count();
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(&app.mode, Mode::Working(job) if job.dry && job.repair));
+        assert!(screen(&mut app, 120, 30).join("\n").contains("what can be repaired"));
+        wait(&mut app);
+        let Mode::Pager { lines, kind: PagerKind::DryRun { actionable: true, repair: true, .. }, .. } = &app.mode else {
+            panic!("no repair preview")
+        };
+        assert!(lines[0].starts_with("DRY RUN: would repair "), "{}", lines[0]);
+        let would = lines.iter().filter(|l| l.starts_with("WOULD REPAIR chunk ")).count();
+        let cannot = lines.iter().filter(|l| l.starts_with("CANNOT REPAIR ")).count();
+        assert!(would > 0 && cannot > 0 && would + cannot == errors, "{would} {cannot} {errors}");
+        assert!(lines.iter().any(|l| l.contains("can only be removed (d)")));
+        assert_eq!(std::fs::read(&region).unwrap(), before, "the preview wrote to the world");
+        assert!(screen(&mut app, 120, 30).join("\n").contains("Enter  Make these repairs"));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.mode, Mode::Working(job) if !job.dry && job.repair));
+        wait(&mut app);
+        let Mode::Pager { lines, kind: PagerKind::Done, .. } = &app.mode else { panic!("not repaired") };
+        assert!(lines[0].starts_with("Done: repaired "), "{}", lines[0]);
+        assert!(lines[1].contains(fix::BACKUP_DIR));
+        assert!(app.stale);
+        assert_eq!(app.state.iter().filter(|s| matches!(s, RowState::Done(what) if what == "repaired")).count(), would);
+        assert_eq!(std::fs::read(&region).unwrap().len(), before.len());
+
+        // What could not be repaired can still be removed.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.targets().len(), cannot);
+        press(&mut app, KeyCode::Char('d'));
+        wait(&mut app);
+        assert!(matches!(&app.mode, Mode::Pager { kind: PagerKind::DryRun { actionable: true, repair: false, .. }, .. }));
     }
 
     #[test]

@@ -133,6 +133,10 @@ pub fn details(f: &Finding) -> Vec<String> {
     lines.push(f.kind.explain().to_string());
     lines.push(String::new());
     lines.push(fix_text(f).to_string());
+    if f.slot.is_some() && f.severity() == Severity::Error {
+        lines.push(String::new());
+        lines.push(crate::repair::hint(f.kind));
+    }
     lines
 }
 

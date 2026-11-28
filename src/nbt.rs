@@ -48,6 +48,8 @@ pub struct ChunkInfo {
     pub section_problem: Option<String>,
     /// How many block and biome containers were measured.
     pub containers: u32,
+    /// `LastUpdate` of a terrain chunk: the game tick it was saved at.
+    pub last_update: Option<i64>,
 }
 
 impl ChunkInfo {
@@ -122,6 +124,11 @@ impl<'a> Walker<'a> {
     fn i32(&mut self) -> Result<i32> {
         let b = self.bytes(4)?;
         Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn i64(&mut self) -> Result<i64> {
+        let b = self.bytes(8)?;
+        Ok(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     fn name(&mut self) -> Result<&'a [u8]> {
@@ -230,10 +237,11 @@ impl<'a> Walker<'a> {
     }
 
     /// `Level` of a pre-1.18 terrain chunk (a compound at level 1).
-    fn level(&mut self) -> Result<Option<(i32, i32)>> {
+    fn level(&mut self, last_update: &mut Option<i64>) -> Result<Option<(i32, i32)>> {
         let (mut x, mut z) = (None, None);
         while let Some((tag, name)) = self.entry()? {
             match (tag, name) {
+                (4, b"LastUpdate") => *last_update = Some(self.i64()?),
                 (3, b"xPos") => x = Some(self.i32()?),
                 (3, b"zPos") => z = Some(self.i32()?),
                 _ => self.skip(tag, 2)?,
@@ -309,7 +317,8 @@ pub fn inspect(buf: &[u8], sections: bool) -> Result<ChunkInfo> {
             (3, b"xPos") => x = Some(w.i32()?),
             (3, b"zPos") => z = Some(w.i32()?),
             (3, b"DataVersion") => info.data_version = Some(w.i32()?),
-            (10, b"Level") => info.level_pos = w.level()?,
+            (4, b"LastUpdate") => info.last_update = Some(w.i64()?),
+            (10, b"Level") => info.level_pos = w.level(&mut info.last_update)?,
             (11, b"Position") => {
                 let n = w.len()?;
                 if n >= 2 {

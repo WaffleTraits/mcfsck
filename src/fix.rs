@@ -49,6 +49,10 @@ pub enum Status {
     Skipped(String),
     /// There is nothing this tool can do about the finding.
     NoFix,
+    /// Repaired without loss (or, in a dry run, would be), and how.
+    Repaired(String),
+    /// Nothing can be repaired without loss, and why.
+    NotRepairable(String),
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +77,8 @@ impl Outcome {
             }
             Status::Skipped(why) => format!("SKIPPED {target} - {why}"),
             Status::NoFix => format!("NO FIX {target} - {}: nothing to remove", finding.kind.label()),
+            Status::Repaired(how) => format!("{} {target} - {how}", if dry_run { "WOULD REPAIR" } else { "REPAIRED" }),
+            Status::NotRepairable(why) => format!("CANNOT REPAIR {target} - {}: {why}", finding.kind.label()),
         }
     }
 }
@@ -80,6 +86,8 @@ impl Outcome {
 #[derive(Debug)]
 pub struct Report {
     pub dry_run: bool,
+    /// A report of [`crate::repair`]: nothing was removed.
+    pub repair: bool,
     /// One per finding, in the order given.
     pub outcomes: Vec<Outcome>,
     pub backup_dir: Option<PathBuf>,
@@ -98,12 +106,52 @@ impl Report {
                 (Status::Removed, _) => c.0 += 1,
                 (Status::Skipped(_), _) => c.2 += 1,
                 (Status::NoFix, _) => c.3 += 1,
+                (Status::Repaired(_) | Status::NotRepairable(_), _) => {}
             }
         }
         c
     }
 
+    /// (repaired, cannot be repaired, skipped)
+    pub fn repair_counts(&self) -> (u64, u64, u64) {
+        let count = |pick: fn(&Status) -> bool| self.outcomes.iter().filter(|o| pick(&o.status)).count() as u64;
+        (
+            count(|s| matches!(s, Status::Repaired(_))),
+            count(|s| matches!(s, Status::NotRepairable(_))),
+            count(|s| matches!(s, Status::Skipped(_))),
+        )
+    }
+
+    fn repair_summary(&self) -> String {
+        let (repaired, not, skipped) = self.repair_counts();
+        let mut text = format!(
+            "{} {} chunk{}",
+            if self.dry_run { "DRY RUN: would repair" } else { "Done: repaired" },
+            human_count(repaired),
+            s(repaired)
+        );
+        if not > 0 {
+            text.push_str(&format!("; {} cannot be repaired", human_count(not)));
+        }
+        if skipped > 0 {
+            text.push_str(&format!("; {} skipped", human_count(skipped)));
+        }
+        if self.files > 0 {
+            text.push_str(&format!(
+                " ({} file{} {})",
+                human_count(self.files),
+                s(self.files),
+                if self.dry_run { "would be touched" } else { "touched" }
+            ));
+        }
+        text.push_str(if self.dry_run { ". Nothing was written." } else { "." });
+        text
+    }
+
     pub fn summary(&self) -> String {
+        if self.repair {
+            return self.repair_summary();
+        }
         let (chunks, files, skipped, nofix) = self.counts();
         let mut text = format!(
             "{} {} chunk{} and {} file{}",
@@ -136,7 +184,7 @@ impl Report {
 // Backups
 // ---------------------------------------------------------------------------
 
-struct Backup {
+pub struct Backup {
     root: PathBuf,
     enabled: bool,
     dir: Option<PathBuf>,
@@ -144,6 +192,15 @@ struct Backup {
 }
 
 impl Backup {
+    pub fn new(root: &Path, enabled: bool) -> Backup {
+        Backup { root: root.to_path_buf(), enabled, dir: None, saved: HashSet::new() }
+    }
+
+    /// The folder the copies went to, if any were made.
+    pub fn into_dir(self) -> Option<PathBuf> {
+        self.dir
+    }
+
     fn new_dir(&self) -> Result<PathBuf> {
         let base = self.root.join(BACKUP_DIR);
         fs::create_dir_all(&base).with_context(|| format!("creating {}", base.display()))?;
@@ -160,7 +217,7 @@ impl Backup {
     }
 
     /// Copy `path` into the backup folder, once.
-    fn save(&mut self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         if !self.enabled || self.saved.contains(path) {
             return Ok(());
         }
@@ -205,11 +262,11 @@ enum Cleared {
     No(String),
 }
 
-fn be32(b: &[u8]) -> u32 {
+pub fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
-fn write_at(file: &mut File, at: u64, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_at(file: &mut File, at: u64, bytes: &[u8]) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(at))?;
     file.write_all(bytes)
 }
@@ -357,12 +414,11 @@ fn remove_file(f: &Finding, dry_run: bool, backup: &mut Backup) -> std::result::
 // The whole job
 // ---------------------------------------------------------------------------
 
-/// Fix `findings` (from a scan of `root`), or with `dry_run` report what
-/// fixing them would do.
-pub fn execute(root: &Path, findings: &[&Finding], opts: &FixOptions, progress: &Progress) -> Result<Report> {
-    let mut warnings = Vec::new();
-    // Held until the end, so the game cannot open the world half-way through.
-    let _lock = match world::lock_world(root) {
+/// Take the world's lock for the duration of a job, or refuse the job if a
+/// game or server has the world open. The lock must be held until the job is
+/// done, so that the game cannot open the world half-way through.
+pub fn acquire(root: &Path, opts: &FixOptions, warnings: &mut Vec<String>) -> Result<Option<world::SessionLock>> {
+    Ok(match world::lock_world(root) {
         LockResult::Acquired(lock) => (!opts.dry_run).then_some(lock),
         LockResult::InUse(lock) => {
             if opts.dry_run {
@@ -387,7 +443,14 @@ pub fn execute(root: &Path, findings: &[&Finding], opts: &FixOptions, progress: 
             warnings.push(format!("Could not check whether the world is in use ({}: {e}).", lock.display()));
             None
         }
-    };
+    })
+}
+
+/// Fix `findings` (from a scan of `root`), or with `dry_run` report what
+/// fixing them would do.
+pub fn execute(root: &Path, findings: &[&Finding], opts: &FixOptions, progress: &Progress) -> Result<Report> {
+    let mut warnings = Vec::new();
+    let _lock = acquire(root, opts, &mut warnings)?;
 
     let mut outcomes: Vec<Outcome> =
         findings.iter().map(|f| Outcome { n: f.n, fix: f.fix(), status: Status::NoFix, notes: Vec::new() }).collect();
@@ -403,7 +466,7 @@ pub fn execute(root: &Path, findings: &[&Finding], opts: &FixOptions, progress: 
     progress.total.store((by_file.len() + whole_files.len()) as u64, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
 
-    let mut backup = Backup { root: root.to_path_buf(), enabled: opts.backup, dir: None, saved: HashSet::new() };
+    let mut backup = Backup::new(root, opts.backup);
     // Header entries cleared so far (in a dry run: that would be).
     let mut gone: HashSet<(PathBuf, usize)> = HashSet::new();
     // Region files changed and files removed so far (in a dry run: that would be).
@@ -509,7 +572,7 @@ pub fn execute(root: &Path, findings: &[&Finding], opts: &FixOptions, progress: 
         progress.done.fetch_add(1, Ordering::Relaxed);
     }
 
-    Ok(Report { dry_run: opts.dry_run, outcomes, backup_dir: backup.dir, files: touched.len() as u64, warnings })
+    Ok(Report { dry_run: opts.dry_run, repair: false, outcomes, backup_dir: backup.dir, files: touched.len() as u64, warnings })
 }
 
 #[cfg(test)]

@@ -1,12 +1,15 @@
 # mcfsck
 
 A fast, multi-threaded checker for Minecraft Java Edition worlds. It reads every chunk the way the game
-does, reports the ones the game cannot load, and can remove them safely so the game generates them anew.
+does, reports the ones the game cannot load, repairs those that can be repaired without losing anything,
+and can remove the rest safely so the game generates them anew.
 
 ```
 mcfsck tui  /srv/minecraft/world     # full-screen: scan, browse, preview, fix
 mcfsck scan /srv/minecraft/world     # list every problem (read-only)
-mcfsck fix  /srv/minecraft/world     # dry run: show what would be removed
+mcfsck fix  /srv/minecraft/world --repair           # dry run: what can be repaired without loss
+mcfsck fix  /srv/minecraft/world --repair --apply
+mcfsck fix  /srv/minecraft/world                    # dry run: what would have to be removed
 mcfsck fix  /srv/minecraft/world --apply
 ```
 
@@ -100,9 +103,41 @@ by one object per finding: `n`, `severity`, `kind`, `problem`, `detail`, `file`,
 Scanning a world that is being played is allowed (nothing is written), but a chunk the game is saving at
 that moment can look damaged. mcfsck says so when it notices the world is open.
 
+## fix --repair
+
+Some errors are damage to the bookkeeping around a chunk while the chunk itself is intact. `--repair`
+puts those right and removes nothing:
+
+```sh
+mcfsck fix world --repair              # dry run: what can be repaired, what cannot and why
+mcfsck fix world --repair --apply      # asks, then does it (--yes for scripts)
+mcfsck fix world --repair --kind wrong_position --apply
+```
+
+| Error | Repair |
+| --- | --- |
+| `negative_length`, `truncated`, `missing_stream` | A zlib or gzip stream marks its own end. If the stream behind the bad length field is complete, the length is corrected. |
+| `bad_compression` | If the data is an intact chunk in one of the known schemes, the scheme marker is corrected. |
+| `truncated`, `zero_sectors` | If the chunk's data runs on into sectors nothing else uses, the sector count in the header is corrected. |
+| `header_overlap`, `zero_sectors`, `out_of_bounds` | The header entry leads nowhere. The sectors no entry claims are searched for a complete chunk with this position, and the entry is pointed at it. With several copies the one with the highest `LastUpdate` wins; if they do not say, nothing is done. |
+| `wrong_position` | The data is filed under the chunk it says it is, if that chunk is in the same region file and has no entry or unloadable data. If that chunk already points at the very same data, the extra entry is dropped. Either way the emptied slot is then searched for its own data as above. |
+
+Everything else - damaged compressed data, damaged NBT, a missing `.mcc` file - cannot be repaired: the
+format keeps no redundancy, so the bytes are gone. Those are listed with the reason and left untouched;
+`mcfsck fix` (below) removes them when you decide to.
+
+A repair is only made if the chunk afterwards passes every check of the scan. It writes nothing but the
+5-byte header of a chunk and 4-byte entries of the region header: chunk data is never moved or rewritten,
+and the file keeps its size. Dry run, backups, the world lock and the "changed since the scan" rule work
+exactly as described under [Safety](#safety).
+
+One caveat: a chunk found again in unused sectors is the newest complete copy still in the file. If the
+game saved the chunk once more after writing that copy and it is that last save which was lost, you get
+the state before it - older, but real, instead of freshly generated terrain.
+
 ## fix
 
-A chunk the game cannot load is gone already; the only question is whether the game regenerates it
+A chunk the game cannot load is gone already (unless `--repair` can bring it back); the only question is whether the game regenerates it
 quietly, spams the log on every load, or crashes. `fix` takes such chunks out of their region file, the
 same way the game deletes a chunk, so that fresh terrain is generated there the next time someone visits.
 
@@ -156,6 +191,7 @@ The whole flow in one screen, keyboard and mouse:
 | Enter, double-click | everything about the finding, with a `/tp` command to go and look |
 | `/` | filter: words that must all appear (`error`, `nether`, `entities`, `corrupt`, `12,-5`, a file name) |
 | `s` / `S`, click a column header | sort / reverse |
+| `p` | repair the selection (or the current finding) where that loses nothing: **shows a dry run first**, Enter applies it |
 | `d` | remove the selection (or the current finding): **shows a dry run first**, Enter applies it |
 | `r` | rescan |
 | `c` | what the scan looked into |
